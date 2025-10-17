@@ -1,0 +1,4 @@
+results/**/*
+wandb/**/*
+cached_data/**/*
+**/__pycache__

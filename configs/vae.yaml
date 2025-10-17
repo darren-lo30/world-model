@@ -1,0 +1,31 @@
+seed_everything: true
+trainer:
+  num_nodes: 1
+  max_epochs: 100
+  check_val_every_n_epoch: 10
+model:
+  in_channels: 3
+  out_channels: 3
+  latent_channels: 32
+  hidden_channels: 32
+  ch_mult:
+  - 2
+  - 2
+  - 2
+  sample_latent: false
+  num_res_blocks: 3
+data: 
+  batch_size: 64
+  val_size: 256
+  train_size: 10000
+  cache_dir: './cached_data'
+optimizer: 
+  class_path: torch.optim.AdamW
+  init_args:
+    lr: 1e-4
+    betas:
+    - 0.9
+    - 0.999
+    eps: 1.0e-08
+    weight_decay: 1e-4
+lr_scheduler: null

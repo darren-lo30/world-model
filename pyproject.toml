@@ -1,0 +1,18 @@
+[project]
+name = "world-model"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "einops>=0.8.1",
+    "gymnasium[box2d]>=1.2.0",
+    "jsonargparse[signatures]>=4.27.7",
+    "lightning>=2.5.5",
+    "matplotlib>=3.10.7",
+    "modal>=1.2.0",
+    "swig>=4.3.1.post0",
+    "torch>=2.8.0",
+    "torchvision>=0.23.0",
+    "wandb>=0.21.3",
+]
