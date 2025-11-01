@@ -5,3 +5,4 @@ class WorldModelTrainer():
         self.env = gym.make("CarRacing-v3", domain_randomize=True)
 
     def train(self):
+        self

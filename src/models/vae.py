@@ -226,14 +226,13 @@ class Decoder(nn.Module):
         return h
 
 class DiagonalGaussian(nn.Module):
-    def __init__(self, sample: bool = True, chunk_dim: int = 1):
+    def __init__(self, chunk_dim: int = 1):
         super().__init__()
-        self.sample = sample
         self.chunk_dim = chunk_dim
 
-    def forward(self, z: Tensor) -> Tensor:
+    def forward(self, z: Tensor, sample: bool) -> Tensor:
         mean, logvar = torch.chunk(z, 2, dim=self.chunk_dim)
-        if self.sample:
+        if sample:
             std = torch.exp(0.5 * logvar)
             return mean + std * torch.randn_like(mean)
         else:
@@ -270,7 +269,6 @@ class VAE(L.LightningModule):
         latent_channels: int = 32,
         hidden_channels: int = 32,
         ch_mult: list[int] = [2, 2, 2],
-        sample_latent: bool = False,
         num_res_blocks: int = 3,
     ):
         super().__init__()
@@ -289,22 +287,21 @@ class VAE(L.LightningModule):
             num_res_blocks=num_res_blocks,
             latent_channels=latent_channels,
         )
-        self.reg = DiagonalGaussian(sample=sample_latent)
+        self.reg = DiagonalGaussian()
 
-    def encode(self, x: Tensor) -> Tensor:
-        z = self.reg(self.encoder(x))
+    def encode(self, x: Tensor, sample: bool) -> Tensor:
+        z = self.reg(self.encoder(x), sample)
         return z
 
     def decode(self, z: Tensor) -> Tensor:
         return self.decoder(z)
 
-    def forward(self, x: Tensor) -> Tensor:
-        return self.decode(self.encode(x))
+    def forward(self, x: Tensor, sample: bool) -> Tensor:
+        return self.decode(self.encode(x), sample)
     
     def training_step(self, batch, batch_idx):
         x = batch
-        z = self.reg(self.encoder(x))
-        x_hat = self.decoder(z)
+        x_hat = self.forwrard(x, sample=True)
         loss = nn.functional.mse_loss(x_hat, x)
 
         self.log("train_loss", loss)
@@ -312,7 +309,7 @@ class VAE(L.LightningModule):
     
     def validation_step(self, batch, batch_idx):
         x = batch
-        x_hat = self.forward(x)
+        x_hat = self.forward(x, sample=False)
         val_loss = torch.nn.functional.mse_loss(x_hat, x)
         self.log("val_loss", val_loss)
 

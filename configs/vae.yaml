@@ -17,7 +17,7 @@ model:
 data: 
   batch_size: 64
   val_size: 256
-  train_size: 10000
+  train_size: 256
   cache_dir: './cached_data'
 optimizer: 
   class_path: torch.optim.AdamW
