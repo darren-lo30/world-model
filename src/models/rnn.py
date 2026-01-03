@@ -3,6 +3,7 @@ import torch.nn as nn
 import lightning as L
 from torch.distributions import Categorical, Normal, MixtureSameFamily, Independent
 import matplotlib.pyplot as plt
+import wandb
 
 class LSTM(nn.Module):
     def __init__(self, input_size, hidden_size):
@@ -54,9 +55,10 @@ def sample_gmm(pi, mu, sigma, n_samples):
     samples = gmm.sample((n_samples,))
     return samples
 
-def visualize_predictions(dist, batch, vae):
+def visualize_predictions(model, dist, batch, vae, epoch):
     pi, mu, sigma = dist
-    x, _, _, _ = batch
+    x, _, _, _ = batch 
+    vae = vae.to(x.device)
 
     fig, ax = plt.subplots()
     n_samples = 5
@@ -66,27 +68,26 @@ def visualize_predictions(dist, batch, vae):
         img = img.clamp(0, 255).to(dtype=torch.uint8)
         return img
     
-    print(x.shape)
     x = x[:, 0, ...]
     x = denormalize(x).cpu().numpy()
 
-    print(pi.shape, mu.shape, sigma.shape)
-    samples = sample_gmm(pi, mu, sigma, n_samples)
-    print(samples.shape)
-    samples = samples[:, 0, ...]
-    print(samples.shape)
+    samples = sample_gmm(pi, mu, sigma, n_samples) # [n_samples, batch, time, latent_dim]
+    # Get rid of time dimension
+    samples = samples[:, :, 0, :]
+    samples_shape = samples.shape
+    samples = samples.view((samples_shape[0] * samples_shape[1], -1))
     samples = vae.decode(samples)
     samples = denormalize(samples)
-
+    samples = samples.reshape(n_samples, -1, *samples.shape[1:])
 
     fig, axes = plt.subplots(1, n_samples + 1, figsize=(8, 4))
-    for i in range(0, len(x), len(x) // 50):
+    for i in range(0, len(x), len(x) // 16):
         axes[0].imshow(x[i])
         axes[0].set_title("Original")
         axes[0].axis("off")
 
         for j in range(n_samples):
-            axes[j + 1].imshow(samples[j])
+            axes[j + 1].imshow(samples[j][i].cpu().numpy())
             axes[j + 1].set_title(f"Prediction {j}")
             axes[j + 1].axis("off")
 
@@ -158,7 +159,7 @@ class WorldModelRNN(L.LightningModule):
         loss, dist = self.compute_loss(batch)
         self.log("val_loss", loss)
 
-        visualize_predictions(dist, batch, self.trainer.datamodule.vae)
+        visualize_predictions(self, dist, batch, self.trainer.datamodule.vae, self.current_epoch)
         return loss
 
     def configure_optimizers(self):
