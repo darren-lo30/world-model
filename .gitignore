@@ -2,3 +2,5 @@ results/**/*
 wandb/**/*
 cached_data/**/*
 **/__pycache__
+videos/**/*
+*.txt

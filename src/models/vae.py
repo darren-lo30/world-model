@@ -6,239 +6,22 @@ import torch
 import lightning as L
 import matplotlib.pyplot as plt
 import wandb
-# This architecture is taken from FLUX including some of the Encoder/Decoder code
-
-
-def swish(x: Tensor) -> Tensor:
-    return x * F.sigmoid(x)
-
-class ResnetBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int):
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-
-        self.norm1 = nn.GroupNorm(num_groups=32, num_channels=in_channels, affine=True)
-        self.conv1 = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
-
-        self.norm2 = nn.GroupNorm(num_groups=32, num_channels=in_channels, affine=True)
-        self.conv2 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
-
-        if self.in_channels != self.out_channels:
-            self.skip = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1)
-
-    def forward(self, x) -> Tensor:
-        y = x
-        y = self.conv1(swish(self.norm1(y)))
-        y = self.conv2(swish(self.norm2(y)))
-
-        if self.in_channels != self.out_channels:
-            x = self.skip(x)
-
-        return x + y
-
-
-class AttnBlock(nn.Module):
-    def __init__(self, in_channels: int):
-        super().__init__()
-        self.in_channels = in_channels
-
-        self.norm = nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
-
-        self.proj_qkv = nn.Conv2d(in_channels, in_channels * 3, kernel_size=1)
-        self.proj_out = nn.Conv2d(in_channels, in_channels, kernel_size=1)
-
-    def attention(self, x: Tensor) -> Tensor:
-        x = self.norm(x)
-        q, k, v = self.proj_qkv(x).chunk(3, dim = 1)
-
-        # We don't add positional encodings here (for some reason)
-        b, c, h, w = q.shape
-        q = rearrange(q, "b c h w -> b 1 (h w) c").contiguous()
-        k = rearrange(k, "b c h w -> b 1 (h w) c").contiguous()
-        v = rearrange(v, "b c h w -> b 1 (h w) c").contiguous()
-        x = nn.functional.scaled_dot_product_attention(q, k, v)
-
-        return rearrange(x, "b 1 (h w) c -> b c h w", h=h, w=w, c=c, b=b)
-
-    def forward(self, x: Tensor) -> Tensor:
-        return x + self.proj_out(self.attention(x))
-    
-
-class Downsample(nn.Module):
-    def __init__(self, in_channels: int):
-        super().__init__()
-        # no asymmetric padding in torch conv, must do it ourselves
-        self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=2, padding=0)
-
-    def forward(self, x: Tensor):
-        pad = (0, 1, 0, 1)
-        x = nn.functional.pad(x, pad, mode="constant", value=0)
-        x = self.conv(x)
-        return x
-
-class Upsample(nn.Module):
-    def __init__(self, in_channels: int):
-        super().__init__()
-        self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
-
-    def forward(self, x: Tensor):
-        x = nn.functional.interpolate(x, scale_factor=2.0, mode="nearest")
-        x = self.conv(x)
-        return x
-    
-class Encoder(nn.Module):
-    def __init__(
-        self,
-        in_channels: int,
-        hidden_channels: int,
-        ch_mult: list[int],
-        num_res_blocks: int,
-        latent_channels: int,
-    ):
-        super().__init__()
-        self.hidden_channels = hidden_channels
-        self.num_resolutions = len(ch_mult)
-        self.num_res_blocks = num_res_blocks
-        self.in_channels = in_channels
-        # downsampling
-        self.conv_in = nn.Conv2d(in_channels, self.hidden_channels, kernel_size=3, stride=1, padding=1)
-
-        self.down = nn.ModuleList()
-        block_in = self.hidden_channels
-        for i_level in range(self.num_resolutions):
-            block = nn.ModuleList()
-            block_in = hidden_channels * (ch_mult[i_level - 1] if i_level > 0 else 1)
-            block_out = hidden_channels * ch_mult[i_level]
-            for _ in range(self.num_res_blocks):
-                block.append(ResnetBlock(in_channels=block_in, out_channels=block_out))
-                block_in = block_out
-            down = nn.Module()
-            down.block = block
-            if i_level != self.num_resolutions - 1:
-                down.downsample = Downsample(block_in)
-            self.down.append(down)
-
-        # middle
-        self.mid = nn.Module()
-        self.mid.block_1 = ResnetBlock(in_channels=block_in, out_channels=block_in)
-        self.mid.attn_1 = AttnBlock(block_in)
-        self.mid.block_2 = ResnetBlock(in_channels=block_in, out_channels=block_in)
-
-        # end
-        self.norm_out = nn.GroupNorm(num_groups=32, num_channels=block_in, eps=1e-6, affine=True)
-        self.conv_out = nn.Conv2d(block_in, 2 * latent_channels, kernel_size=3, stride=1, padding=1)
-
-    def forward(self, x: Tensor) -> Tensor:
-        # downsampling
-        h = self.conv_in(x)
-        for i_level in range(self.num_resolutions):
-            for i_block in range(self.num_res_blocks):
-                h = self.down[i_level].block[i_block](h)
-
-            # Do not downsample the last resolution
-            if i_level != self.num_resolutions - 1:
-                h = self.down[i_level].downsample(h)
-
-        # middle
-        h = self.mid.block_1(h)
-        h = self.mid.attn_1(h)
-        h = self.mid.block_2(h)
-        # end
-        h = self.norm_out(h)
-        h = swish(h)
-        h = self.conv_out(h)
-        return h
-
-
-class Decoder(nn.Module):
-    def __init__(
-        self,
-        hidden_channels: int,
-        out_channels: int,
-        ch_mult: list[int],
-        num_res_blocks: int,
-        in_channels: int,
-        latent_channels: int,
-    ):
-        super().__init__()
-        self.hidden_channels = hidden_channels
-        self.num_resolutions = len(ch_mult)
-        self.num_res_blocks = num_res_blocks
-
-        self.in_channels = in_channels
-
-        # compute in_ch_mult, block_in and curr_res at lowest res
-        block_in = hidden_channels * ch_mult[self.num_resolutions - 1]
-
-        # z to block_in
-        self.conv_in = nn.Conv2d(latent_channels, block_in, kernel_size=3, stride=1, padding=1)
-
-        # middle
-        self.mid = nn.Module()
-        self.mid.block_1 = ResnetBlock(in_channels=block_in, out_channels=block_in)
-        self.mid.attn_1 = AttnBlock(block_in)
-        self.mid.block_2 = ResnetBlock(in_channels=block_in, out_channels=block_in)
-
-        # upsampling
-        self.up = nn.ModuleList()
-        for i_level in reversed(range(self.num_resolutions)):
-            block = nn.ModuleList()
-            block_out = hidden_channels * ch_mult[i_level]
-            for _ in range(self.num_res_blocks + 1):
-                block.append(ResnetBlock(in_channels=block_in, out_channels=block_out))
-                block_in = block_out
-            up = nn.Module()
-            up.block = block
-            if i_level != 0:
-                up.upsample = Upsample(block_in)
-            self.up.insert(0, up)  # prepend to get consistent order
-
-        # end
-        self.norm_out = nn.GroupNorm(num_groups=32, num_channels=block_in, eps=1e-6, affine=True)
-        self.conv_out = nn.Conv2d(block_in, out_channels, kernel_size=3, stride=1, padding=1)
-
-    def forward(self, z: Tensor) -> Tensor:
-        # get dtype for proper tracing
-        upscale_dtype = next(self.up.parameters()).dtype
-
-        # z to block_in
-        h = self.conv_in(z)
-
-        # middle
-        h = self.mid.block_1(h)
-        h = self.mid.attn_1(h)
-        h = self.mid.block_2(h)
-
-        # cast to proper dtype
-        h = h.to(upscale_dtype)
-        # upsampling
-        for i_level in reversed(range(self.num_resolutions)):
-            for i_block in range(self.num_res_blocks + 1):
-                h = self.up[i_level].block[i_block](h)
-            if i_level != 0:
-                h = self.up[i_level].upsample(h)
-
-        # end
-        h = self.norm_out(h)
-        h = swish(h)
-        h = self.conv_out(h)
-        return h
 
 class DiagonalGaussian(nn.Module):
     def __init__(self, chunk_dim: int = 1):
         super().__init__()
         self.chunk_dim = chunk_dim
 
-    def forward(self, z: Tensor, sample: bool) -> Tensor:
+    def forward(self, z: Tensor, sample: bool) -> tuple[Tensor, Tensor, Tensor]:
         mean, logvar = torch.chunk(z, 2, dim=self.chunk_dim)
         if sample:
             std = torch.exp(0.5 * logvar)
-            return mean + std * torch.randn_like(mean)
+            z_sample = mean + std * torch.randn_like(mean)
         else:
-            return mean
+            z_sample = mean
+        return z_sample, mean, logvar
 
-def visualize_predictions(model, x, x_hat):
+def visualize_predictions(model, x, x_hat, epoch):
     fig, ax = plt.subplots()
     def denormalize(img):
         img = (img + 1) * 127.5
@@ -250,73 +33,132 @@ def visualize_predictions(model, x, x_hat):
     x_hat = denormalize(x_hat).cpu().numpy()
 
     fig, axes = plt.subplots(1, 2, figsize=(8, 4))
-    axes[0].imshow(x[0])
-    axes[0].set_title("Original")
-    axes[0].axis("off")
+    for i in range(len(x)):
+        axes[0].imshow(x[i])
+        axes[0].set_title("Original")
+        axes[0].axis("off")
 
-    axes[1].imshow(x_hat[0])
-    axes[1].set_title("Prediction")
-    axes[1].axis("off")
+        axes[1].imshow(x_hat[i])
+        axes[1].set_title("Prediction")
+        axes[1].axis("off")
 
-    model.logger.experiment.log({"val/prediction": wandb.Image(fig)})
-    plt.close(fig)
+        model.logger.experiment.log({f"val/prediction_epoch{epoch}": wandb.Image(fig)})
+        plt.close(fig)
+
+
+class Decoder(nn.Module):
+    def __init__(self, img_channels, latent_size):
+        super().__init__()
+        self.latent_size = latent_size
+        self.img_channels = img_channels
+
+        self.fc = nn.Linear(latent_size, 1024)
+        self.encoder_conv = nn.Sequential(
+            nn.ConvTranspose2d(1024, 128, 5, stride=2), nn.ReLU(),
+            nn.ConvTranspose2d(128, 64, 5, stride=2), nn.ReLU(),
+            nn.ConvTranspose2d(64, 32, 6, stride=2), nn.ReLU(),
+            nn.ConvTranspose2d(32, img_channels, 6, stride=2),
+        )
+
+    def forward(self, x):
+        x = F.relu(self.fc(x))
+        x = x.unsqueeze(-1).unsqueeze(-1)
+        return F.tanh(self.encoder_conv(x))
+
+class Encoder(nn.Module):
+    def __init__(self, img_channels, latent_size):
+        super().__init__()
+        self.latent_size = latent_size
+        self.img_channels = img_channels
+
+        self.encoder_conv = nn.Sequential(
+            nn.Conv2d(img_channels, 32, 4, stride=2), nn.ReLU(),
+            nn.Conv2d(32, 64, 4, stride=2), nn.ReLU(),
+            nn.Conv2d(64, 128, 4, stride=2), nn.ReLU(),
+            nn.Conv2d(128, 256, 4, stride=2), nn.ReLU()
+        )
+        self.fc_mu_logvar = nn.Linear(256 * 4, latent_size * 2)
+
+    def forward(self, x):
+        x = self.encoder_conv(x)
+        x = x.view(x.size(0), -1)
+        
+        return self.fc_mu_logvar(x)
+
 
 class VAE(L.LightningModule):
     def __init__(
         self,
-        in_channels: int = 3,
-        out_channels: int = 3,
-        latent_channels: int = 32,
-        hidden_channels: int = 32,
-        ch_mult: list[int] = [2, 2, 2],
-        num_res_blocks: int = 3,
+        in_channels: int,
+        latent_channels: int,
     ):
         super().__init__()
+        self.save_hyperparameters()
         self.encoder = Encoder(
-            in_channels=in_channels,
-            hidden_channels=hidden_channels,
-            ch_mult=ch_mult,
-            num_res_blocks=num_res_blocks,
-            latent_channels=latent_channels,
+            in_channels,
+            latent_channels
         )
         self.decoder = Decoder(
-            in_channels=in_channels,
-            hidden_channels=hidden_channels,
-            out_channels=out_channels,
-            ch_mult=ch_mult,
-            num_res_blocks=num_res_blocks,
-            latent_channels=latent_channels,
+            in_channels, 
+            latent_channels
         )
         self.reg = DiagonalGaussian()
 
-    def encode(self, x: Tensor, sample: bool) -> Tensor:
-        z = self.reg(self.encoder(x), sample)
-        return z
+    def encode(self, x: Tensor, sample: bool) -> tuple[Tensor, Tensor, Tensor]:
+        z_sample, mean, logvar = self.reg(self.encoder(x), sample)
+        return z_sample, mean, logvar
 
     def decode(self, z: Tensor) -> Tensor:
         return self.decoder(z)
 
-    def forward(self, x: Tensor, sample: bool) -> Tensor:
-        return self.decode(self.encode(x), sample)
-    
-    def training_step(self, batch, batch_idx):
-        x = batch
-        x_hat = self.forwrard(x, sample=True)
-        loss = nn.functional.mse_loss(x_hat, x)
+    def kl_divergence_loss(self, mean: Tensor, logvar: Tensor) -> Tensor:
+        kl_loss = -0.5 * torch.sum(1 + logvar - mean.pow(2) - logvar.exp())
+        return kl_loss
 
+    def forward(self, x: Tensor, sample: bool) -> tuple[Tensor, Tensor, Tensor]:
+        z_sample, mean, logvar = self.encode(x, sample)
+        x_recon = self.decode(z_sample)
+        return x_recon, mean, logvar
+
+    def compute_loss(self, x_hat, x, mean, logvar):
+        # Reconstruction loss
+        recon_loss = torch.sum((x_hat - x)**2) / x.shape[0]
+        
+        # KL divergence loss
+        kl_loss = self.kl_divergence_loss(mean, logvar) / x.shape[0]
+        
+        # Total loss
+        loss = recon_loss + kl_loss
+
+        return recon_loss, kl_loss, loss
+
+    def training_step(self, batch, batch_idx):
+        x, _, _ = batch
+        x_hat, mean, logvar = self.forward(x, sample=True)
+        
+        # Reconstruction loss
+        recon_loss, kl_loss, loss = self.compute_loss(x_hat, x, mean, logvar)
+        
         self.log("train_loss", loss)
+        self.log("train_recon_loss", recon_loss)
+        self.log("train_kl_loss", kl_loss)
         return loss
     
     def validation_step(self, batch, batch_idx):
-        x = batch
-        x_hat = self.forward(x, sample=False)
-        val_loss = torch.nn.functional.mse_loss(x_hat, x)
-        self.log("val_loss", val_loss)
+        x, _, _ = batch
+        x_hat, mean, logvar = self.forward(x, sample=False)
+        
+        # Reconstruction loss
+        recon_loss, kl_loss, loss = self.compute_loss(x_hat, x, mean, logvar) 
+        
+        self.log("val_loss", loss)
+        self.log("val_recon_loss", recon_loss)
+        self.log("val_kl_loss", kl_loss)
 
-        visualize_predictions(self, x, x_hat)
+        visualize_predictions(self, x, x_hat, self.current_epoch)
 
-        return val_loss
+        return loss
 
 
     def configure_optimizers(self):
-        return super().configure_optimizers()
+        super().configure_optimizers()

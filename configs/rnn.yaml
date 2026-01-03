@@ -1,16 +1,20 @@
 seed_everything: true
 trainer:
   num_nodes: 1
-  max_epochs: 201
-  check_val_every_n_epoch: 25
+  max_epochs: 401
+  check_val_every_n_epoch: 20
 model:
-  in_channels: 3
-  latent_channels: 64
+  input_size: 67 # 3 (action size) + 64 (vae latent size)
+  hidden_size: 128
+  latent_size: 64
+  num_gaussians: 5
 data: 
   batch_size: 64
   val_size: 1000
   train_size: 10000
   cache_dir: './cached_data'
+  model: 'rnn'
+  vae_ckpt_path: '/home/dlslo/world-model/results/vae/2025-12-05_01-01-13/epoch=199.ckpt'
 optimizer: 
   class_path: torch.optim.AdamW
   init_args:
