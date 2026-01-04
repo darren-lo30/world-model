@@ -47,7 +47,6 @@ class LSTM(nn.Module):
 
 def sample_gmm(pi, mu, sigma, n_samples):
     mix = Categorical(probs=pi)
-    comp = Normal(loc=mu, scale=sigma)
     component_dist = Normal(mu, sigma)
     component_dist = Independent(component_dist, 1)
     gmm = MixtureSameFamily(mix, component_dist)
@@ -67,29 +66,36 @@ def visualize_predictions(model, dist, batch, vae, epoch):
         img = img.permute(0, 2, 3, 1) # Reshape to B, H, W, C
         img = img.clamp(0, 255).to(dtype=torch.uint8)
         return img
-    
-    x = x[:, 0, ...]
+
+    x_next = x[:, -1, ...]
+    x = x[:, -2, ...]
     x = denormalize(x).cpu().numpy()
+    x_next = denormalize(x_next).cpu().numpy()
 
     samples = sample_gmm(pi, mu, sigma, n_samples) # [n_samples, batch, time, latent_dim]
     # Get rid of time dimension
-    samples = samples[:, :, 0, :]
+    samples = samples[:, :, -1, :]
     samples_shape = samples.shape
     samples = samples.view((samples_shape[0] * samples_shape[1], -1))
     samples = vae.decode(samples)
     samples = denormalize(samples)
     samples = samples.reshape(n_samples, -1, *samples.shape[1:])
 
-    fig, axes = plt.subplots(1, n_samples + 1, figsize=(8, 4))
+    fig, axes = plt.subplots(1, n_samples + 2, figsize=(12, 4))
     for i in range(0, len(x), len(x) // 16):
         axes[0].imshow(x[i])
         axes[0].set_title("Original")
         axes[0].axis("off")
 
+        axes[1].imshow(x_next[i])
+        axes[1].set_title("Target")
+        axes[1].axis("off")
+
+
         for j in range(n_samples):
-            axes[j + 1].imshow(samples[j][i].cpu().numpy())
-            axes[j + 1].set_title(f"Prediction {j}")
-            axes[j + 1].axis("off")
+            axes[j + 2].imshow(samples[j][i].cpu().numpy())
+            axes[j + 2].set_title(f"Prediction {j}")
+            axes[j + 2].axis("off")
 
         model.logger.experiment.log({f"val/prediction_epoch{epoch}": wandb.Image(fig)})
         plt.close(fig)
@@ -99,7 +105,14 @@ class WorldModelRNN(L.LightningModule):
         super().__init__()
         self.save_hyperparameters()
 
-        self.rnn = LSTM(input_size, hidden_size)
+        self.num_layers = 1
+        # self.rnn = LSTM(input_size, hidden_size)
+        self.rnn = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=self.num_layers,
+            batch_first=True
+        )
         self.hidden_size = hidden_size
         self.latent_size = latent_size
         self.num_gaussians = num_gaussians
@@ -111,20 +124,30 @@ class WorldModelRNN(L.LightningModule):
 
         self.lr = lr
 
+
     def forward(self, x, h=None, c=None):
-        y, (h, c) = self.rnn(x, h, c)
+        B, L, _ = x.shape
+
+        if h is None or c is None:
+            h0, c0 = self.get_init_state(B)
+        else:
+            h0, c0 = h, c
+
+        y, (h, c) = self.rnn(x, (h0, c0))
+
 
         B, L, D = y.shape
 
         pi = torch.softmax(self.fc_pi(y), dim=-1)
         mu = self.fc_mu(y).view(B, L, self.num_gaussians, self.latent_size)
-        sigma = torch.exp(self.fc_sigma(y)).view(B, L, self.num_gaussians, self.latent_size)
+        sigma = torch.exp(self.fc_sigma(y)).view(B, L, self.num_gaussians, self.latent_size) + 1e-4
 
         return pi, mu, sigma, (h, c)
 
     def get_init_state(self, batch_size):
-        h = torch.zeros((batch_size, self.hidden_size))
-        c = torch.zeros((batch_size, self.hidden_size))
+        device = self.device
+        h = torch.zeros((self.num_layers, batch_size, self.hidden_size), device=device)
+        c = torch.zeros((self.num_layers, batch_size, self.hidden_size), device=device)
 
         return h, c
 

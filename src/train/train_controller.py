@@ -59,9 +59,8 @@ def evaluate_model_rollout(controller, env_name, vae, rnn, num_rollouts = 16):
             obs = (obs - 127.5) / 127.5
             obs = obs.to(device=device).unsqueeze(0)
             encoded, _, _ = vae.encode(obs, sample=False)
-            action = controller(encoded, h)           
-            _, _, _, (h, c) = rnn(torch.cat([encoded.unsqueeze(0), action.view(1, 1, -1)], dim=-1), h, c)
-
+            action = controller(encoded, h[:, 0, ...]) # Unsqueeze num_layers   
+            _, _, _, (h, c) = rnn(torch.cat([encoded.unsqueeze(0), action.view(1, 1, -1)], dim=-1), h, c)            
             obs, reward, done, info, _ = env.step(action.squeeze(0).cpu().numpy())
 
             total_reward += reward
